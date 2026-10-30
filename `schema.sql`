@@ -1,0 +1,381 @@
+
+-- ==========================================
+-- KIMI Messenger - Initial Database Schema
+-- ==========================================
+
+create extension if not exists pgcrypto;
+
+-- 1. User profiles
+create table public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  username text unique,
+  display_name text not null default 'KIMI User',
+  avatar_url text,
+  bio text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- 2. Conversations
+create table public.conversations (
+  id uuid primary key default gen_random_uuid(),
+  title text,
+  type text not null check (type in ('direct', 'group')),
+  owner_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+-- 3. Conversation members
+create table public.conversation_members (
+  conversation_id uuid not null
+    references public.conversations(id) on delete cascade,
+  user_id uuid not null
+    references auth.users(id) on delete cascade,
+  role text not null default 'member'
+    check (role in ('owner', 'admin', 'member')),
+  joined_at timestamptz not null default now(),
+  primary key (conversation_id, user_id)
+);
+
+-- 4. Messages
+create table public.messages (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null
+    references public.conversations(id) on delete cascade,
+  sender_id uuid not null
+    references auth.users(id) on delete cascade,
+  body text not null,
+  message_type text not null default 'text'
+    check (message_type in ('text', 'image', 'file')),
+  created_at timestamptz not null default now(),
+  edited_at timestamptz
+);
+
+-- 5. Channels
+create table public.channels (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  description text,
+  owner_id uuid not null references auth.users(id) on delete cascade,
+  is_public boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+-- 6. Channel members
+create table public.channel_members (
+  channel_id uuid not null
+    references public.channels(id) on delete cascade,
+  user_id uuid not null
+    references auth.users(id) on delete cascade,
+  role text not null default 'member'
+    check (role in ('owner', 'admin', 'member')),
+  joined_at timestamptz not null default now(),
+  primary key (channel_id, user_id)
+);
+
+-- 7. Channel posts
+create table public.channel_posts (
+  id uuid primary key default gen_random_uuid(),
+  channel_id uuid not null
+    references public.channels(id) on delete cascade,
+  author_id uuid not null
+    references auth.users(id) on delete cascade,
+  body text not null,
+  created_at timestamptz not null default now()
+);
+
+-- ==========================================
+-- Indexes
+-- ==========================================
+
+create index messages_conversation_created_idx
+  on public.messages(conversation_id, created_at);
+
+create index messages_sender_idx
+  on public.messages(sender_id);
+
+create index conversation_members_user_idx
+  on public.conversation_members(user_id);
+
+create index channel_members_user_idx
+  on public.channel_members(user_id);
+
+create index channel_posts_channel_created_idx
+  on public.channel_posts(channel_id, created_at);
+
+-- ==========================================
+-- Enable Row Level Security
+-- ==========================================
+
+alter table public.profiles enable row level security;
+alter table public.conversations enable row level security;
+alter table public.conversation_members enable row level security;
+alter table public.messages enable row level security;
+alter table public.channels enable row level security;
+alter table public.channel_members enable row level security;
+alter table public.channel_posts enable row level security;
+
+-- ==========================================
+-- Explicit API permissions
+-- ==========================================
+
+revoke all on table
+  public.profiles,
+  public.conversations,
+  public.conversation_members,
+  public.messages,
+  public.channels,
+  public.channel_members,
+  public.channel_posts
+from anon, authenticated;
+
+grant select, insert, update, delete on table
+  public.profiles,
+  public.conversations,
+  public.conversation_members,
+  public.messages,
+  public.channels,
+  public.channel_members,
+  public.channel_posts
+to authenticated;
+
+-- ==========================================
+-- Profiles policies
+-- ==========================================
+
+create policy "Authenticated users can view profiles"
+on public.profiles for select
+to authenticated
+using (true);
+
+create policy "Users can create their profile"
+on public.profiles for insert
+to authenticated
+with check ((select auth.uid()) = id);
+
+create policy "Users can update their profile"
+on public.profiles for update
+to authenticated
+using ((select auth.uid()) = id)
+with check ((select auth.uid()) = id);
+
+create policy "Users can delete their profile"
+on public.profiles for delete
+to authenticated
+using ((select auth.uid()) = id);
+
+-- ==========================================
+-- Conversations policies
+-- ==========================================
+
+create policy "Members can view conversations"
+on public.conversations for select
+to authenticated
+using (
+  owner_id = (select auth.uid())
+  or exists (
+    select 1
+    from public.conversation_members cm
+    where cm.conversation_id = id
+      and cm.user_id = (select auth.uid())
+  )
+);
+
+create policy "Users can create conversations"
+on public.conversations for insert
+to authenticated
+with check (owner_id = (select auth.uid()));
+
+create policy "Owners can update conversations"
+on public.conversations for update
+to authenticated
+using (owner_id = (select auth.uid()))
+with check (owner_id = (select auth.uid()));
+
+create policy "Owners can delete conversations"
+on public.conversations for delete
+to authenticated
+using (owner_id = (select auth.uid()));
+
+-- ==========================================
+-- Conversation members policies
+-- ==========================================
+
+create policy "Users can view their memberships"
+on public.conversation_members for select
+to authenticated
+using (user_id = (select auth.uid()));
+
+create policy "Owners can add conversation members"
+on public.conversation_members for insert
+to authenticated
+with check (
+  user_id = (select auth.uid())
+  or exists (
+    select 1
+    from public.conversations c
+    where c.id = conversation_id
+      and c.owner_id = (select auth.uid())
+  )
+);
+
+create policy "Users can leave conversations"
+on public.conversation_members for delete
+to authenticated
+using (user_id = (select auth.uid()));
+
+-- ==========================================
+-- Messages policies
+-- ==========================================
+
+create policy "Members can read messages"
+on public.messages for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.conversation_members cm
+    where cm.conversation_id = messages.conversation_id
+      and cm.user_id = (select auth.uid())
+  )
+);
+
+create policy "Members can send messages"
+on public.messages for insert
+to authenticated
+with check (
+  sender_id = (select auth.uid())
+  and exists (
+    select 1
+    from public.conversation_members cm
+    where cm.conversation_id = messages.conversation_id
+      and cm.user_id = (select auth.uid())
+  )
+);
+
+create policy "Users can edit their messages"
+on public.messages for update
+to authenticated
+using (sender_id = (select auth.uid()))
+with check (sender_id = (select auth.uid()));
+
+create policy "Users can delete their messages"
+on public.messages for delete
+to authenticated
+using (sender_id = (select auth.uid()));
+
+-- ==========================================
+-- Channels policies
+-- ==========================================
+
+create policy "Users can view public or joined channels"
+on public.channels for select
+to authenticated
+using (
+  is_public = true
+  or owner_id = (select auth.uid())
+  or exists (
+    select 1
+    from public.channel_members cm
+    where cm.channel_id = id
+      and cm.user_id = (select auth.uid())
+  )
+);
+
+create policy "Users can create channels"
+on public.channels for insert
+to authenticated
+with check (owner_id = (select auth.uid()));
+
+create policy "Owners can update channels"
+on public.channels for update
+to authenticated
+using (owner_id = (select auth.uid()))
+with check (owner_id = (select auth.uid()));
+
+create policy "Owners can delete channels"
+on public.channels for delete
+to authenticated
+using (owner_id = (select auth.uid()));
+
+-- ==========================================
+-- Channel members policies
+-- ==========================================
+
+create policy "Users can view their channel memberships"
+on public.channel_members for select
+to authenticated
+using (user_id = (select auth.uid()));
+
+create policy "Channel owners can add members"
+on public.channel_members for insert
+to authenticated
+with check (
+  user_id = (select auth.uid())
+  or exists (
+    select 1
+    from public.channels c
+    where c.id = channel_id
+      and c.owner_id = (select auth.uid())
+  )
+);
+
+create policy "Users can leave channels"
+on public.channel_members for delete
+to authenticated
+using (user_id = (select auth.uid()));
+
+-- ==========================================
+-- Channel posts policies
+-- ==========================================
+
+create policy "Users can read accessible channel posts"
+on public.channel_posts for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.channels c
+    where c.id = channel_id
+      and (
+        c.is_public = true
+        or c.owner_id = (select auth.uid())
+        or exists (
+          select 1
+          from public.channel_members cm
+          where cm.channel_id = c.id
+            and cm.user_id = (select auth.uid())
+        )
+      )
+  )
+);
+
+create policy "Members can publish channel posts"
+on public.channel_posts for insert
+to authenticated
+with check (
+  author_id = (select auth.uid())
+  and exists (
+    select 1
+    from public.channels c
+    where c.id = channel_id
+      and (
+        c.owner_id = (select auth.uid())
+        or exists (
+          select 1
+          from public.channel_members cm
+          where cm.channel_id = c.id
+            and cm.user_id = (select auth.uid())
+        )
+      )
+  )
+);
+
+create policy "Authors can delete their posts"
+on public.channel_posts for delete
+to authenticated
+using (author_id = (select auth.uid()));
+
+-- ==========================================
+-- End of KIMI initial schema
+-- ==========================================
